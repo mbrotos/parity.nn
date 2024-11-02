@@ -6,6 +6,7 @@ import os
 
 from models.mlp import MultiLayerPerceptron
 from datapipeline import ParityDataset
+from models.rnn import SimpleRNN
 from utils import setup_logger, log_dir
 
 
@@ -20,7 +21,7 @@ def parse_args():
         help="Name of the experiment.",
     )
     parser.add_argument(
-        "--model", type=str, default="mlp", help="Model to use."
+        "--model", type=str, default="rnn", help="Model to use."
     )
     parser.add_argument(
         "--dataset", type=str, default="./data", help="Path to the dataset."
@@ -48,46 +49,68 @@ def parse_args():
     )
     return parser.parse_args()
 
-
-def train_loop(model, train_loader, loss_fn, optimizer, device):
+def train_loop(model, train_loader, loss_fn, optimizer, device, epochs):
     model.train()
-    size = len(train_loader.dataset)
-    for batch, (X, y) in enumerate(train_loader):
-        X, y = X.to(device), y.to(device)
-        pred = model(X)
-        loss = loss_fn(pred, y)
-        optimizer.zero_grad()
-        loss.backward()
+    total_step = len(train_loader)
 
-        if batch % 50 == 0:
-            loss, current = loss.item(), (batch + 1) * len(X)
-            log.info(f"loss: {loss:>7f}  [{current:>5d}/{size:>5d}]")
+    print("Training...\n")
+    print('-'*60)
+
+    for epoch in range(1, epochs+1):
+        for step, (features, labels) in enumerate(train_loader):
+            features, labels = features.to(device), labels.to(device)
+
+            # Forward pass
+            outputs = model(features)
+            loss = loss_fn(outputs, labels)
+
+            if isinstance(optimizer, torch.optim.Optimizer):
+                # Backward and optimize
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+            elif optimizer == "random":
+                # Random update on range of -10 to 10
+                for param in model.parameters():
+                    param.data = (torch.rand(param.shape) * 20 - 10).to(device)
+            accuracy = ((outputs > 0.5) == (labels > 0.5)).type(torch.FloatTensor).mean()
+
+            if (step+1) % 250 == 0:
+                print ('Epoch [{}/{}], Step [{}/{}], Loss: {:.4f}, Accuracy: {:.3f}' 
+                       .format(epoch, epochs, 
+                        step+1, total_step, 
+                        loss.item(), accuracy))
+                print('-'*60)
+                if abs(accuracy - 1.0) < 0.0001:
+                    print("EARLY STOPPING")
+                    return
 
 
 def test_loop(model, train_loader, test_loader, loss_fn, device):
     model.eval()
-    train_loss = 0
     test_loss = 0
-    train_correct = 0
     test_correct = 0
-    with torch.no_grad():
-        for test_batch, train_batch in zip(test_loader, train_loader):
-            X_test, y_test = test_batch
-            X_train, y_train = train_batch
-            X_test, y_test = X_test.to(device), y_test.to(device)
-            X_train, y_train = X_train.to(device), y_train.to(device)
-            pred = model(X_test)
-            test_loss += loss_fn(pred, y_test).item()
-            test_correct += (pred.round() == y_test).sum().item()
-            pred = model(X_train)
-            train_loss += loss_fn(pred, y_train).item()
-            train_correct += (pred.round() == y_train).sum().item()
+    train_loss = 0
+    train_correct = 0
+    total_test = 0
+    total_train = 0
+    for X_test, y_test in test_loader:
+        X_test, y_test = X_test.to(device), y_test.to(device)
+        pred = model(X_test)
+        test_loss += loss_fn(pred, y_test).item()
+        test_correct += ((pred > 0.5) == (y_test > 0.5)).sum().item()
+        total_test += X_test.shape[0] * X_test.shape[1]
+    for X_train, y_train in train_loader:
+        X_train, y_train = X_train.to(device), y_train.to(device)
+        pred = model(X_train)
+        train_loss += loss_fn(pred, y_train).item()
+        train_correct += (pred.round() == y_train).sum().item()
+        total_train += X_train.shape[0] * X_train.shape[1]
 
-    test_loss = test_loss / len(test_loader.dataset)
-    test_accuracy = test_correct / len(test_loader.dataset)
-    train_loss = train_loss / len(train_loader.dataset)
-    train_accuracy = train_correct / len(train_loader.dataset)
-
+    test_loss = test_loss / len(test_loader)
+    test_accuracy = test_correct / total_test
+    train_loss = train_loss / len(train_loader)
+    train_accuracy = train_correct / total_train
     log.info(f"Test Loss: {test_loss:.4f}, Accuracy: {test_accuracy:.4f}")
     log.info(f"Train Loss: {train_loss:.4f}, Accuracy: {train_accuracy:.4f}")
     return {
@@ -102,12 +125,8 @@ def main(args, log):
     log.info(f"Starting training with the following arguments: {args}")
 
     log.info("Loading the dataset...")
-    train_dataset = ParityDataset(
-        os.path.join(args.dataset, "train.csv"), args.bitstring_length
-    )
-    test_dataset = ParityDataset(
-        os.path.join(args.dataset, "test.csv"), args.bitstring_length
-    )
+    train_dataset = ParityDataset(seed=42)
+    test_dataset = ParityDataset(seed=43)
 
     # Create data loaders
     train_loader = DataLoader(
@@ -120,12 +139,16 @@ def main(args, log):
     log.info("Initializing the model...")
     if args.model == "mlp":
         model = MultiLayerPerceptron(args.bitstring_length)
+    elif args.model == "rnn":
+        model = SimpleRNN()
     else:
         raise ValueError(f"Model {args.model} not supported.")
 
     # Initialize the optimizer
     if args.optimizer == "adamw":
         optimizer = torch.optim.AdamW(model.parameters())
+    elif args.optimizer == "random":
+        optimizer = "random"
     else:
         raise ValueError(f"Optimizer {args.optimizer} not supported.")
 
@@ -137,10 +160,8 @@ def main(args, log):
     model.to(device)
 
     log.info("Starting training...")
-    for epoch in range(args.epochs):
-        log.info(f"Epoch {epoch+1}")
-        train_loop(model, train_loader, loss_fn, optimizer, device)
-        metrics = test_loop(model, train_loader, test_loader, loss_fn, device)
+    train_loop(model, train_loader, loss_fn, optimizer, device, args.epochs)
+    metrics = test_loop(model, train_loader, test_loader, loss_fn, device)
 
     log.info("Training complete.")
 
